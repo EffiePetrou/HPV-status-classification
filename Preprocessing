@@ -1,0 +1,81 @@
+from pathlib import Path
+import pydicom
+import numpy as np
+import cv2
+import os
+import pandas as pd
+import nibabel as nib
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
+from skimage.transform import resize
+
+# Read provided file in a cvs format
+labels = pd.read_csv("/Data/HPV_STATUS.csv")  
+
+
+ROOT_PATH = Path("/Data/CT_images/")
+SAVE_PATH = Path("/Data/Processed/")
+
+
+# Each subplot displays a slice of the CT scan from a different patient along with its corresponding label
+fig, axis = plt.subplots(3, 3, figsize=(9, 9))
+c = 0
+
+for i in range(3):
+    for j in range(3):
+        patient_id = labels.PatientID.iloc[c]
+        nii_path = ROOT_PATH / f"{patient_id}_ct.nii.gz" 
+        img = nib.load(nii_path)  # Load NIfTI file
+
+        dcm = img.get_fdata()     # Get the image data from the NIfTI file
+
+        label = labels["Target"].iloc[c]
+
+        axis[i][j].imshow(dcm[:, :, c], cmap="bone")  # Visualization of the image
+        axis[i][j].set_title(label)  # Use the corresponding label as the title
+        c += 1
+
+plt.tight_layout()
+plt.show()
+
+
+# Preprocessing of CTs
+sums, sums_squared, ss = 0, 0, 0
+
+# for patient_id in tqdm(labels.PatientID):
+for c, patient_id in enumerate(tqdm(labels.PatientID)):
+
+    print(c,patient_id)
+    nii_path = ROOT_PATH / f"{patient_id}_ct.nii.gz"  
+    img = nib.load(nii_path)  # Load NIfTI file
+
+    dcm = img.get_fdata()  # Get the image data from the NIfTI file
+
+    dcm = (dcm - np.min(dcm)) / (np.max(dcm) - np.min(dcm))  # Normalization to a range between 0 and 1
+
+    for slice_index in range(dcm.shape[-1]):
+        # Process each slice separately
+        slice_data = dcm[:, :, slice_index]
+
+        slice_array = cv2.resize(slice_data, (224, 224)).astype(np.float16)  # Resize shape = (224,224)
+
+        label = labels.loc[labels['PatientID'] == patient_id].iloc[0]['Target']  # Access label for the corresponding slice 
+        # print(c)
+
+        train_or_val = "train" if c < 29 else "val"  # 14 as training set and 5 as validation set
+
+        current_save_path = SAVE_PATH / train_or_val / str(label)
+        current_save_path.mkdir(parents=True, exist_ok=True)
+
+        np.save(current_save_path / f"{patient_id}_slice_{slice_index}.npy", slice_array)   # Save processed slices
+
+        normalizer = 224 * 224
+        if train_or_val == "train":
+            sums += np.sum(slice_array) / normalizer
+            sums_squared += (slice_array ** 2).sum() / normalizer
+            ss += 1
+
+
+# Convert the sums and sum squared into mean and std
+mean = sums / ss                                         
+std = np.sqrt((sums_squared / ss ) - mean**2) 
