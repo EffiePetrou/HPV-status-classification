@@ -76,4 +76,3 @@ print("Recall:", recall)
 
 f1 = f1_score(y_test, y_pred)
 print("F1 Score:", f1)
-
