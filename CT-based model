@@ -191,5 +191,3 @@ print(f"F-1 Score {F1}")
 print(f"Val AUC {AUC}") # This is probably not applicable for our study
 print(f"Confusion Matrix {cm}")
 print(f"Confusion Matrix 2:\n {cm_threshed}")
-
-
