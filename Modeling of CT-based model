@@ -1,0 +1,195 @@
+import torch
+import torchvision
+from torchvision import transforms
+import torchmetrics
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from tqdm.notebook import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# Creation of train and validation dataset
+def load_file(path):
+    return np.load(path).astype(np.float32)
+
+train_transforms = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(0.0867675322566451, 0.13365382738638584),
+    transforms.RandomAffine(degrees=(-5, 5), translate=(0, 0.05), scale=(0.9, 1.1)), # Random affine which allows to rotate, translate and scale the image
+    transforms.RandomResizedCrop((224,224), scale=(0.35, 1))
+]) 
+
+# Validation Transforms
+val_transforms = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(0.0867675322566451, 0.13365382738638584) 
+])
+
+
+train_dataset = torchvision.datasets.DatasetFolder("Data/Processed/train/", loader = load_file, extensions="npy", transform=train_transforms)
+val_dataset = torchvision.datasets.DatasetFolder("Data/Processed/val/", loader = load_file, extensions="npy", transform=val_transforms)
+
+
+# Creation of train and validation loaders 
+batch_size = 16  # Depends on the computer
+num_workers = 4
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+
+
+# Creation of the model
+class HPVModel(pl.LightningModule):
+    
+    def __init__(self, weight=3):    # Create or load the model, define optimizers, loss function and adequate metrics
+        super().__init__()
+
+        self.model = torchvision.models.resnet18()
+        self.model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=(7,7), stride=(2,2), padding=(3,3), bias=False)
+        self.model.fc = torch.nn.Linear(in_features=512, out_features=1, bias=True)
+        
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
+        self.loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([weight]))
+        
+        self.train_acc = torchmetrics.Accuracy()
+        self.val_acc = torchmetrics.Accuracy()
+        
+    def forward(self, data):  # Computes forward pass or prediction -> Output of ResNet18 and return of raw prediction
+        pred = self.model(data)
+        return pred
+    
+    def training_step(self, batch, batch_idx):
+        ct, label = batch
+        label = label.float()
+        pred = self(ct)[:,0]   # Labels only of shape batch size, while predictons are of shape (batch_size, 1) -- REMOVE 2 DIMENSIONS INSTEAD OF 1 ?
+        loss = self.loss_fn(pred, label)
+        
+        # Log the loss and batch accuracy
+        self.log("Train_Loss", loss)
+        self.log("Step Train ACC", self.train_acc(torch.sigmoid(pred), label.int()))  # Convert pred into probability
+        #self.log("Step Train Acc", self.train_acc(torch.sigmoid(pred), label.int()))
+
+                 
+        return loss
+                 
+    def training_epoch_end(self, outs):  # Definition of what happens after the epoch has finished
+        self.log("Train ACC", self.train_acc.compute())
+        
+                 
+    def validation_step(self, batch, batch_idx):
+        ct, label = batch
+        label = label.float()
+        pred = self(ct)[:,0]   # Labels only of shape batch size, while predictons are of shape (batch_size, 1) --- REMOVE 2 DIMENSIONS INSTEAD OF 1 ?
+        loss = self.loss_fn(pred, label)
+        
+        # Log the loss and batch accuracy
+        self.log("Val Loss", loss)
+        self.log("Step Val ACC", self.val_acc(torch.sigmoid(pred), label.int()))
+                 
+                 
+    def validation_epoch_end(self, outs):
+        self.log("Val ACC", self.val_acc.compute())
+                 
+    def configure_optimizers(self):  # Returns a list of all optimizers
+        return [self.optimizer]
+
+
+# Evaluation of the Model
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") #Check if gpu is available so uses it
+
+model = HPVModel.load_from_checkpoint("logs/default/version_8/checkpoints/epoch=98-step=66032.ckpt") #Change the path for the weights file 
+model.eval()
+model.to(device)
+
+
+# Computation of pred on the val set and storage of pred and corresponding labels
+preds = []
+labels = []
+CTpreds = []
+
+CTlabels = []
+ptsPred=[]
+ptsLabel=[]
+pts=""
+j=0
+predbcp=0
+labelbcp=0
+
+with torch.no_grad():   # Prevent PyTorch from storing the gradients -> raw pred
+    for data, label in tqdm(val_dataset):
+        data = data.to(device).float().unsqueeze(0)
+        pred = torch.sigmoid(model(data)[0].cpu())
+        
+        ##########################################################
+        sample_fname = val_loader.dataset.samples[j]
+        sliceName = sample_fname[0].split("/")
+        CTname=sliceName[4].split("_")
+        if pts==CTname[0]:
+            ptsPred.append(pred)
+            ptsLabel.append(label)
+            labelbcp=label
+        elif pts=="":
+            pts=CTname[0]
+            ptsPred.append(pred)
+            ptsLabel.append(label)
+        else:
+            pts=CTname[0]
+            predbcp=torch.mean(torch.tensor(ptsPred))
+            CTpreds.append(torch.mean(torch.tensor(ptsPred)))
+            CTlabels.append(labelbcp)
+            ptsPred=[]
+            ptsPred.append(pred)
+            ptsLabel.append(label)
+            print(CTname[0],predbcp,labelbcp)
+        j+=1
+        ############################################################
+
+        preds.append(pred)
+        labels.append(label)
+
+preds = torch.tensor(preds)
+labels = torch.tensor(labels).int()
+CTpreds = torch.tensor(CTpreds)
+CTlabels = torch.tensor(CTlabels).int()
+
+
+# Computation of different metrics - Patient evaluation
+acc = torchmetrics.Accuracy() (CTpreds, CTlabels) 
+precision = torchmetrics.Precision() (CTpreds, CTlabels)              
+recall = torchmetrics.Recall() (CTpreds, CTlabels)                     
+cm = torchmetrics.ConfusionMatrix(num_classes=2) (CTpreds, CTlabels)   
+cm_threshed = torchmetrics.ConfusionMatrix(num_classes=2, threshold=0.25)(CTpreds, CTlabels)
+F1 = 2 * (precision*recall) / (precision+recall)
+AUC = torchmetrics.functional.auc(CTpreds, CTlabels, reorder=True)
+
+print("patient evaluation (complete CT)")
+print(f"Val Accuracy {acc}")
+print(f"Val Precision {precision}")
+print(f"Val Recall {recall}")
+print(f"Val F-1 Score {F1}")
+print(f"Val AUC {AUC}") # This is probably not applicable for our study
+print(f"Confusion Matrix {cm}")
+print(f"Confusion Matrix 2:\n {cm_threshed}")
+
+
+# Computation of different metrics - SLices evaluation
+acc = torchmetrics.Accuracy() (preds, labels) 
+precision = torchmetrics.Precision() (preds, labels)              
+recall = torchmetrics.Recall() (preds, labels)                     
+cm = torchmetrics.ConfusionMatrix(num_classes=2) (preds, labels)   
+cm_threshed = torchmetrics.ConfusionMatrix(num_classes=2, threshold=0.25)(preds, labels)
+F1 = 2 * (precision*recall) / (precision+recall)
+AUC = torchmetrics.functional.auc(preds, labels, reorder=True)
+
+print("slices evaluation")
+print(f"Val Accuracy {acc}")
+print(f"Val Precision {precision}")
+print(f"Val Recall {recall}")
+print(f"F-1 Score {F1}")
+print(f"Val AUC {AUC}") # This is probably not applicable for our study
+print(f"Confusion Matrix {cm}")
+print(f"Confusion Matrix 2:\n {cm_threshed}")
+
+
